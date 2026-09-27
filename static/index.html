@@ -1,3 +1,11 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>无人机空域协调台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#4338ca;color:white;border:0;border-radius:6px}</style>
-<h1>无人机空域协调台</h1><p>查看飞行计划与当前空域限制。提交、审核、变更和紧急授权通过 JSON API 完成。</p><section><input id="u" value="reviewer"><input id="r" value="airspace_reviewer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#f3f6fa;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 12px #0001}pre{background:#101828;color:#fde68a;padding:16px;border-radius:8px;overflow:auto}input,button{font:inherit;padding:8px;margin:4px}button{background:#4338ca;color:white;border:0;border-radius:6px}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}</style>
+<h1>无人机空域协调台</h1><p>查看飞行计划、空域限制与备降协同（余量、占用计划、改降记录）。提交、审核、变更、紧急授权和改降通过 JSON API 完成。</p>
+<section><div class="row"><input id="u" value="reviewer"><input id="r" value="airspace_reviewer"><button onclick="load()">刷新</button></div>
+<h3>计划与限制</h3><pre id="o"></pre>
+<h3>备降协调台</h3><pre id="d"></pre></section>
+<script>
+async function get(path){let x=await fetch(path,{headers:{'X-User-Id':u.value,'X-Role':r.value}});return await x.json()}
+async function load(){let [state,board]=await Promise.all([get('/api/state'),get('/api/diversion-board')]);o.textContent=JSON.stringify(state,null,2);d.textContent=JSON.stringify(board,null,2)}
+load();
+</script>
