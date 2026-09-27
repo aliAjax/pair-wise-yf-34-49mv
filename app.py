@@ -32,6 +32,14 @@ def parse_time(value: str | None) -> datetime:
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
+def parse_window(value: Any) -> str:
+    text = str(value or "").strip(); parts = text.split(":")
+    if len(parts) != 2 or not all(part.isdigit() for part in parts): raise ApiError(400, "invalid_window", "开放时段格式须为 HH:MM")
+    hour, minute = int(parts[0]), int(parts[1])
+    if hour > 23 or minute > 59: raise ApiError(400, "invalid_window", "开放时段超出 00:00-23:59 范围")
+    return f"{hour:02d}:{minute:02d}"
+
+
 def route_bbox(route: list[list[float]]) -> tuple[float, float, float, float]:
     xs = [float(point[0]) for point in route]; ys = [float(point[1]) for point in route]
     return min(xs), min(ys), max(xs), max(ys)
@@ -85,7 +93,26 @@ class Repository:
             id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL,
             detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS alternates(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, models_json TEXT NOT NULL,
+            open_start TEXT NOT NULL, open_end TEXT NOT NULL, capacity INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS alternate_bookings(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, alternate_id INTEGER NOT NULL REFERENCES alternates(id),
+            plan_id INTEGER NOT NULL REFERENCES flight_plans(id), plan_revision INTEGER NOT NULL,
+            slot TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', starts_at TEXT NOT NULL, ends_at TEXT NOT NULL,
+            created_at TEXT NOT NULL, released_at TEXT, release_reason TEXT
+        );
+        CREATE TABLE IF NOT EXISTS diversions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES flight_plans(id),
+            from_alternate_id INTEGER, to_alternate_id INTEGER, result TEXT NOT NULL,
+            reason TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL
+        );
         """)
+        plan_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(flight_plans)")}
+        for column in ("primary_alternate_id", "backup_alternate_id"):
+            if column not in plan_cols: self.conn.execute(f"ALTER TABLE flight_plans ADD COLUMN {column} INTEGER")
 
     @contextmanager
     def tx(self):
@@ -143,14 +170,16 @@ class DroneAirspaceService:
         if not 0 <= payload <= 25 or altitude <= 0 or not isinstance(risk, int) or not 0 <= risk <= 5:
             raise ApiError(400, "invalid_plan", "载荷、高度或人口风险无效")
         if end <= start or start <= utcnow(): raise ApiError(400, "invalid_time", "飞行时间必须在未来且结束晚于开始")
+        primary_alt, backup_alt = body.get("primary_alternate_id"), body.get("backup_alternate_id")
         bbox = route_bbox(route)
         with self.repo.tx() as conn:
+            self._validate_plan_alternates(conn, primary_alt, backup_alt)
             try:
-                cur = conn.execute("""INSERT INTO flight_plans(operator_id,callsign,drone_model,payload_kg,route_json,starts_at,ends_at,max_altitude,population_risk,emergency_plan,region,created_by,created_at,updated_at)
-                                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                   (operator, str(body["callsign"]).upper(), body["drone_model"], payload, json.dumps(route), iso(start), iso(end), altitude, risk, body["emergency_plan"], body["region"], actor, iso(), iso()))
+                cur = conn.execute("""INSERT INTO flight_plans(operator_id,callsign,drone_model,payload_kg,route_json,starts_at,ends_at,max_altitude,population_risk,emergency_plan,region,primary_alternate_id,backup_alternate_id,created_by,created_at,updated_at)
+                                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                   (operator, str(body["callsign"]).upper(), body["drone_model"], payload, json.dumps(route), iso(start), iso(end), altitude, risk, body["emergency_plan"], body["region"], primary_alt, backup_alt, actor, iso(), iso()))
             except sqlite3.IntegrityError as exc: raise ApiError(409, "plan_duplicate", "同一运营方、呼号和起飞时间的计划已存在") from exc
-            plan_id = cur.lastrowid; Repository.audit(conn, plan_id, actor, role, "plan_created", {"bbox": bbox, "revision": 1})
+            plan_id = cur.lastrowid; Repository.audit(conn, plan_id, actor, role, "plan_created", {"bbox": bbox, "revision": 1, "primary_alternate_id": primary_alt, "backup_alternate_id": backup_alt})
             return self.get_plan(plan_id, role, operator)
 
     def _plan_row(self, conn: sqlite3.Connection, plan_id: int) -> sqlite3.Row:
@@ -196,6 +225,10 @@ class DroneAirspaceService:
         if role == "viewer":
             result = {key: result[key] for key in ("id", "callsign", "starts_at", "ends_at", "max_altitude", "region", "status", "valid_until" if "valid_until" in result else "updated_at")}
         if role in {"airspace_reviewer", "commander", "auditor"}: result["approvals"] = [dict(r) for r in conn.execute("SELECT * FROM approvals WHERE plan_id=? ORDER BY id", (plan_id,))]
+        if role != "viewer":
+            booking = conn.execute("""SELECT b.*, a.name AS alternate_name FROM alternate_bookings b JOIN alternates a ON a.id=b.alternate_id
+                                      WHERE b.plan_id=? AND b.status='active' ORDER BY b.id DESC""", (plan_id,)).fetchone()
+            result["alternate_booking"] = dict(booking) if booking else None
         return result
 
     def submit(self, plan_id: int, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -230,10 +263,12 @@ class DroneAirspaceService:
             if report["blocking_conflicts"] and not (role == "commander" and override):
                 raise ApiError(409, "airspace_conflict", "计划存在空域或相邻交通冲突", report)
             override_kind = "emergency_authority" if report["blocking_conflicts"] else None
+            booking_id = self._book_primary_alternate(conn, plan)
             cur = conn.execute("""INSERT INTO approvals(plan_id,plan_revision,reviewer,decision,reason,offline_id,override_kind,created_at)
                                   VALUES(?,?,?,?,?,?,?,?)""", (plan_id, expected, actor, "approved", reason, offline_id, override_kind, iso()))
             conn.execute("UPDATE flight_plans SET status='approved',updated_at=? WHERE id=?", (iso(), plan_id))
             if override_kind: Repository.audit(conn, plan_id, actor, role, "emergency_override_used", {"override_reason": override, "conflicts": report["blocking_conflicts"]})
+            if booking_id: Repository.audit(conn, plan_id, actor, role, "alternate_booked", {"alternate_id": plan["primary_alternate_id"], "booking_id": booking_id, "slot": "primary"})
             Repository.audit(conn, plan_id, actor, role, "plan_approved", {"revision": expected, "offline_id": offline_id})
             Repository.notify(conn, plan_id, "approved", f"飞行计划 {plan['callsign']} 已批准")
             return {"plan": self.get_plan(plan_id, role, ""), "idempotent": False, "approval_id": cur.lastrowid, "override_kind": override_kind}
@@ -270,11 +305,17 @@ class DroneAirspaceService:
             payload = float(body.get("payload_kg", plan["payload_kg"])); altitude = float(body.get("max_altitude", plan["max_altitude"]))
             risk = body.get("population_risk", plan["population_risk"])
             if not 0 <= payload <= 25 or altitude <= 0 or not isinstance(risk, int) or not 0 <= risk <= 5: raise ApiError(400, "invalid_plan", "变更后的载荷、高度或风险无效")
+            primary_alt = body["primary_alternate_id"] if "primary_alternate_id" in body else plan["primary_alternate_id"]
+            backup_alt = body["backup_alternate_id"] if "backup_alternate_id" in body else plan["backup_alternate_id"]
+            self._validate_plan_alternates(conn, primary_alt, backup_alt)
             revision = expected + 1
-            conn.execute("""UPDATE flight_plans SET route_json=?,starts_at=?,ends_at=?,payload_kg=?,max_altitude=?,population_risk=?,emergency_plan=?,region=?,status='draft',revision=?,updated_at=? WHERE id=?""",
-                         (json.dumps(route), iso(start), iso(end), payload, altitude, risk, body.get("emergency_plan", plan["emergency_plan"]), body.get("region", plan["region"]), revision, iso(), plan_id))
-            Repository.audit(conn, plan_id, actor, role, "plan_changed", {"from_revision": expected, "to_revision": revision, "previous_status": plan["status"]})
-            if plan["status"] == "approved": Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} 已修改，原批准自动失效")
+            conn.execute("""UPDATE flight_plans SET route_json=?,starts_at=?,ends_at=?,payload_kg=?,max_altitude=?,population_risk=?,emergency_plan=?,region=?,primary_alternate_id=?,backup_alternate_id=?,status='draft',revision=?,updated_at=? WHERE id=?""",
+                         (json.dumps(route), iso(start), iso(end), payload, altitude, risk, body.get("emergency_plan", plan["emergency_plan"]), body.get("region", plan["region"]), primary_alt, backup_alt, revision, iso(), plan_id))
+            released = self._release_plan_bookings(conn, plan_id, "plan_changed")
+            Repository.audit(conn, plan_id, actor, role, "plan_changed", {"from_revision": expected, "to_revision": revision, "previous_status": plan["status"], "released_alternates": [r["alternate_id"] for r in released]})
+            if plan["status"] == "approved":
+                suffix = "，主备降点名额已释放" if released else ""
+                Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} 已修改，原批准自动失效{suffix}")
             else: Repository.notify(conn, plan_id, "changed", f"飞行计划 {plan['callsign']} 已更新，需重新提交审核")
             return self.get_plan(plan_id, role, operator)
 
@@ -288,7 +329,8 @@ class DroneAirspaceService:
             if plan["status"] == "canceled": return {"plan": self.get_plan(plan_id, role, operator), "idempotent": True}
             if plan["status"] == "expired": raise ApiError(409, "plan_expired", "已过期计划不能取消")
             conn.execute("UPDATE flight_plans SET status='canceled',updated_at=? WHERE id=?", (iso(), plan_id))
-            Repository.audit(conn, plan_id, actor, role, "plan_canceled", {"reason": reason})
+            released = self._release_plan_bookings(conn, plan_id, "plan_canceled")
+            Repository.audit(conn, plan_id, actor, role, "plan_canceled", {"reason": reason, "released_alternates": [r["alternate_id"] for r in released]})
             Repository.notify(conn, plan_id, "canceled", f"飞行计划 {plan['callsign']} 已取消：{reason}")
             return {"plan": self.get_plan(plan_id, role, operator), "idempotent": False}
 
@@ -306,9 +348,170 @@ class DroneAirspaceService:
             rows = list(conn.execute("SELECT * FROM flight_plans WHERE status='approved' AND ends_at<=?", (now,)))
             for row in rows:
                 conn.execute("UPDATE flight_plans SET status='expired',updated_at=? WHERE id=?", (now, row["id"]))
-                Repository.audit(conn, row["id"], actor, role, "plan_expired", {})
+                released = self._release_plan_bookings(conn, row["id"], "plan_expired")
+                Repository.audit(conn, row["id"], actor, role, "plan_expired", {"released_alternates": [r["alternate_id"] for r in released]})
                 Repository.notify(conn, row["id"], "expired", f"飞行计划 {row['callsign']} 已过期")
         return {"expired": len(rows)}
+
+    # ---- 备降协同 ----
+    @staticmethod
+    def _alternate_dict(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row); result["models"] = json.loads(result.pop("models_json")); return result
+
+    def _alternate_row(self, conn: sqlite3.Connection, alternate_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM alternates WHERE id=?", (alternate_id,)).fetchone()
+        if not row: raise ApiError(404, "alternate_not_found", "备降点不存在")
+        return row
+
+    @staticmethod
+    def _validate_models(models: Any) -> list[str]:
+        if not isinstance(models, list) or not models or not all(isinstance(m, str) and m.strip() for m in models):
+            raise ApiError(400, "invalid_alternate", "适用机型必须是非空字符串列表")
+        return [m.strip() for m in models]
+
+    @staticmethod
+    def _validate_capacity(capacity: Any) -> int:
+        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1: raise ApiError(400, "invalid_alternate", "同时容量必须是正整数")
+        return capacity
+
+    @staticmethod
+    def _validate_plan_alternates(conn: sqlite3.Connection, primary_id: Any, backup_id: Any) -> None:
+        for label, alternate_id in (("primary_alternate_id", primary_id), ("backup_alternate_id", backup_id)):
+            if alternate_id is None: continue
+            if not isinstance(alternate_id, int) or isinstance(alternate_id, bool): raise ApiError(400, "invalid_alternate", f"{label} 必须是备降点编号")
+            if not conn.execute("SELECT 1 FROM alternates WHERE id=?", (alternate_id,)).fetchone(): raise ApiError(400, "alternate_not_found", f"备降点 {alternate_id} 不存在")
+        if primary_id is not None and primary_id == backup_id: raise ApiError(400, "invalid_alternate", "主备降点和备用备降点不能相同")
+
+    @staticmethod
+    def _within_open_window(row: sqlite3.Row, start: datetime, end: datetime) -> bool:
+        open_min = int(row["open_start"][:2]) * 60 + int(row["open_start"][3:5])
+        close_min = int(row["open_end"][:2]) * 60 + int(row["open_end"][3:5])
+        if close_min <= open_min: close_min += 1440  # 跨午夜时段，如 20:00-06:00
+        if (end - start).total_seconds() > (close_min - open_min) * 60: return False
+        def fits(moment: datetime) -> bool:
+            minute = moment.hour * 60 + moment.minute
+            return any(open_min <= candidate <= close_min for candidate in (minute, minute + 1440))
+        return fits(start) and fits(end)
+
+    def _occupancy_report(self, conn: sqlite3.Connection, alternate_id: int, start: str, end: str, exclude_plan_id: int | None = None) -> dict[str, Any]:
+        row = self._alternate_row(conn, alternate_id)
+        query = """SELECT b.id AS booking_id, b.plan_id, p.callsign, p.operator_id, b.slot, b.starts_at, b.ends_at
+                   FROM alternate_bookings b JOIN flight_plans p ON p.id=b.plan_id
+                   WHERE b.alternate_id=? AND b.status='active' AND b.starts_at<? AND b.ends_at>?"""
+        params: list[Any] = [alternate_id, end, start]
+        if exclude_plan_id is not None: query += " AND b.plan_id!=?"; params.append(exclude_plan_id)
+        occupants = [dict(r) for r in conn.execute(query + " ORDER BY b.starts_at", params)]
+        return {"alternate_id": row["id"], "name": row["name"], "capacity": row["capacity"],
+                "occupied": len(occupants), "remaining": max(0, row["capacity"] - len(occupants)), "occupants": occupants}
+
+    def _validate_alternate_booking(self, conn: sqlite3.Connection, plan: sqlite3.Row, alternate_id: int, exclude_plan_id: int | None = None) -> None:
+        row = self._alternate_row(conn, alternate_id)
+        report = lambda: self._occupancy_report(conn, alternate_id, plan["starts_at"], plan["ends_at"], exclude_plan_id)
+        if row["status"] != "active": raise ApiError(409, "alternate_unavailable", "备降点已关闭", report())
+        if plan["drone_model"] not in json.loads(row["models_json"]):
+            raise ApiError(409, "alternate_model_mismatch", f"备降点不接收机型 {plan['drone_model']}", report())
+        if not self._within_open_window(row, parse_time(plan["starts_at"]), parse_time(plan["ends_at"])):
+            raise ApiError(409, "alternate_closed", "计划时段超出备降点开放时段", report())
+        occupancy = report()
+        if occupancy["occupied"] >= row["capacity"]: raise ApiError(409, "alternate_full", "备降点同时容量已满", occupancy)
+
+    def _book_primary_alternate(self, conn: sqlite3.Connection, plan: sqlite3.Row) -> int | None:
+        alternate_id = plan["primary_alternate_id"]
+        if alternate_id is None: return None
+        self._validate_alternate_booking(conn, plan, alternate_id, exclude_plan_id=plan["id"])
+        cur = conn.execute("""INSERT INTO alternate_bookings(alternate_id,plan_id,plan_revision,slot,status,starts_at,ends_at,created_at)
+                              VALUES(?,?,?,'primary','active',?,?,?)""",
+                           (alternate_id, plan["id"], plan["revision"], plan["starts_at"], plan["ends_at"], iso()))
+        return cur.lastrowid
+
+    @staticmethod
+    def _release_plan_bookings(conn: sqlite3.Connection, plan_id: int, reason: str) -> list[sqlite3.Row]:
+        rows = list(conn.execute("SELECT * FROM alternate_bookings WHERE plan_id=? AND status='active'", (plan_id,)))
+        for row in rows: conn.execute("UPDATE alternate_bookings SET status='released',released_at=?,release_reason=? WHERE id=?", (iso(), reason, row["id"]))
+        return rows
+
+    def create_alternate(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "airspace_reviewer": raise ApiError(403, "alternate_forbidden", "只有空域审核员可以维护备降点")
+        name = str(body.get("name", "")).strip()
+        if not name: raise ApiError(400, "invalid_alternate", "备降点名称必填")
+        models = self._validate_models(body.get("models"))
+        open_start, open_end = parse_window(body.get("open_start")), parse_window(body.get("open_end"))
+        if open_start == open_end: raise ApiError(400, "invalid_window", "开放时段开始和结束不能相同")
+        capacity = self._validate_capacity(body.get("capacity"))
+        with self.repo.tx() as conn:
+            try:
+                cur = conn.execute("""INSERT INTO alternates(name,models_json,open_start,open_end,capacity,created_by,created_at,updated_at)
+                                      VALUES(?,?,?,?,?,?,?,?)""", (name, json.dumps(models, ensure_ascii=False), open_start, open_end, capacity, actor, iso(), iso()))
+            except sqlite3.IntegrityError as exc: raise ApiError(409, "alternate_duplicate", "备降点名称已存在") from exc
+            Repository.audit(conn, None, actor, role, "alternate_created", {"alternate_id": cur.lastrowid, "name": name})
+            return self._alternate_dict(conn.execute("SELECT * FROM alternates WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def update_alternate(self, alternate_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "airspace_reviewer": raise ApiError(403, "alternate_forbidden", "只有空域审核员可以维护备降点")
+        with self.repo.tx() as conn:
+            row = self._alternate_row(conn, alternate_id)
+            name = str(body.get("name", row["name"])).strip()
+            if not name: raise ApiError(400, "invalid_alternate", "备降点名称不能为空")
+            models = self._validate_models(body["models"]) if "models" in body else json.loads(row["models_json"])
+            open_start = parse_window(body["open_start"]) if "open_start" in body else row["open_start"]
+            open_end = parse_window(body["open_end"]) if "open_end" in body else row["open_end"]
+            if open_start == open_end: raise ApiError(400, "invalid_window", "开放时段开始和结束不能相同")
+            capacity = self._validate_capacity(body["capacity"]) if "capacity" in body else row["capacity"]
+            status = body.get("status", row["status"])
+            if status not in {"active", "closed"}: raise ApiError(400, "invalid_alternate", "状态只能是 active 或 closed")
+            try:
+                conn.execute("UPDATE alternates SET name=?,models_json=?,open_start=?,open_end=?,capacity=?,status=?,updated_at=? WHERE id=?",
+                             (name, json.dumps(models, ensure_ascii=False), open_start, open_end, capacity, status, iso(), alternate_id))
+            except sqlite3.IntegrityError as exc: raise ApiError(409, "alternate_duplicate", "备降点名称已存在") from exc
+            Repository.audit(conn, None, actor, role, "alternate_updated", {"alternate_id": alternate_id})
+            return self._alternate_dict(conn.execute("SELECT * FROM alternates WHERE id=?", (alternate_id,)).fetchone())
+
+    def divert(self, plan_id: int, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"commander", "operator"}: raise ApiError(403, "divert_forbidden", "只有指挥官或运营方可以安排紧急改降")
+        reason = str(body.get("reason", "")).strip()
+        if not reason: raise ApiError(400, "reason_required", "改降原因必填")
+        with self.repo.tx() as conn:
+            plan = self._plan_row(conn, plan_id)
+            if role == "operator" and plan["operator_id"] != operator: raise ApiError(403, "plan_forbidden", "不能改降其他运营方计划")
+            if plan["status"] != "approved": raise ApiError(409, "invalid_transition", "只有已批准计划可以紧急改降")
+            current = conn.execute("SELECT * FROM alternate_bookings WHERE plan_id=? AND status='active' ORDER BY id DESC", (plan_id,)).fetchone()
+            from_id = current["alternate_id"] if current else plan["primary_alternate_id"]
+            backup_id = plan["backup_alternate_id"]
+            if from_id is None: raise ApiError(409, "no_primary_alternate", "计划未登记主备降点")
+            if backup_id is None: raise ApiError(409, "no_backup_alternate", "计划未登记备用备降点")
+            if current and current["alternate_id"] == backup_id: raise ApiError(409, "already_diverted", "计划已改降至备用点")
+            try:
+                self._validate_alternate_booking(conn, plan, backup_id, exclude_plan_id=plan_id)
+            except ApiError as exc:
+                conn.execute("INSERT INTO diversions(plan_id,from_alternate_id,to_alternate_id,result,reason,actor,created_at) VALUES(?,?,?,?,?,?,?)",
+                             (plan_id, from_id, backup_id, "kept", f"{reason}；备用点不可接收：{exc.message}", actor, iso()))
+                Repository.audit(conn, plan_id, actor, role, "diversion_kept", {"from_alternate_id": from_id, "backup_alternate_id": backup_id, "cause": exc.code})
+                Repository.notify(conn, plan_id, "diversion_kept", f"飞行计划 {plan['callsign']} 紧急改降未执行：备用点不可接收（{exc.message}），保留原备降安排")
+                return {"result": "kept", "message": "备用点无法接收，保留原备降安排", "cause": exc.code, "occupancy": exc.details, "plan": self.get_plan(plan_id, role, operator)}
+            if current: conn.execute("UPDATE alternate_bookings SET status='released',released_at=?,release_reason='diverted' WHERE id=?", (iso(), current["id"]))
+            conn.execute("""INSERT INTO alternate_bookings(alternate_id,plan_id,plan_revision,slot,status,starts_at,ends_at,created_at)
+                            VALUES(?,?,?,'backup','active',?,?,?)""", (backup_id, plan_id, plan["revision"], plan["starts_at"], plan["ends_at"], iso()))
+            conn.execute("INSERT INTO diversions(plan_id,from_alternate_id,to_alternate_id,result,reason,actor,created_at) VALUES(?,?,?,?,?,?,?)",
+                         (plan_id, from_id, backup_id, "switched", reason, actor, iso()))
+            Repository.audit(conn, plan_id, actor, role, "diversion_switched", {"from_alternate_id": from_id, "to_alternate_id": backup_id})
+            Repository.notify(conn, plan_id, "diversion_switched", f"飞行计划 {plan['callsign']} 已紧急改降至备用点，主备降点名额已释放")
+            return {"result": "switched", "message": "已切换至备用备降点，主点名额已释放", "plan": self.get_plan(plan_id, role, operator)}
+
+    def alternates_board(self, role: str) -> dict[str, Any]:
+        if role not in {"airspace_reviewer", "commander", "auditor", "operator"}: raise ApiError(403, "board_forbidden", "当前角色不能查看备降协调台")
+        conn = self.repo.conn; sites = []
+        for row in conn.execute("SELECT * FROM alternates ORDER BY id"):
+            site = self._alternate_dict(row)
+            bookings = [dict(r) for r in conn.execute("""SELECT b.id AS booking_id, b.plan_id, p.callsign, p.operator_id, b.slot, b.starts_at, b.ends_at
+                                                         FROM alternate_bookings b JOIN flight_plans p ON p.id=b.plan_id
+                                                         WHERE b.alternate_id=? AND b.status='active' ORDER BY b.starts_at""", (row["id"],))]
+            site["occupied"] = len(bookings); site["remaining"] = max(0, row["capacity"] - len(bookings)); site["bookings"] = bookings
+            sites.append(site)
+        diversions = [dict(r) for r in conn.execute("""SELECT d.*, p.callsign, fa.name AS from_alternate_name, ta.name AS to_alternate_name
+                                                       FROM diversions d JOIN flight_plans p ON p.id=d.plan_id
+                                                       LEFT JOIN alternates fa ON fa.id=d.from_alternate_id
+                                                       LEFT JOIN alternates ta ON ta.id=d.to_alternate_id ORDER BY d.id DESC""")]
+        return {"alternates": sites, "diversions": diversions, "server_time": iso()}
 
     def state(self, role: str, operator: str) -> dict[str, Any]:
         conn = self.repo.conn
@@ -341,6 +544,7 @@ class Handler(BaseHTTPRequestHandler):
         actor, role, operator = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state(role, operator)
         if path == "/api/notifications": return 200, self.service.notifications(actor, role, operator)
+        if path == "/api/alternates/board": return 200, self.service.alternates_board(role)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]), role, operator)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "check": return 200, self.service.check_conflicts(int(parts[2]), role, operator)
@@ -348,6 +552,8 @@ class Handler(BaseHTTPRequestHandler):
     def post_api(self, path: str) -> tuple[int, Any]:
         actor, role, operator = self.service.identity(self.headers); body = self.body(); parts = [p for p in path.split("/") if p]
         if path == "/api/restrictions": return 201, self.service.create_restriction(actor, role, body)
+        if path == "/api/alternates": return 201, self.service.create_alternate(actor, role, body)
+        if len(parts) == 4 and parts[:2] == ["api", "alternates"] and parts[2].isdigit() and parts[3] == "update": return 200, self.service.update_alternate(int(parts[2]), actor, role, body)
         if path == "/api/plans": return 201, self.service.create_plan(actor, role, operator, body)
         if path == "/api/expire": return 200, self.service.expire_plans(actor, role)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
@@ -358,6 +564,7 @@ class Handler(BaseHTTPRequestHandler):
                 "reject": lambda: self.service.reject(pid, actor, role, body),
                 "change": lambda: self.service.change(pid, actor, role, operator, body),
                 "cancel": lambda: self.service.cancel(pid, actor, role, operator, body),
+                "divert": lambda: self.service.divert(pid, actor, role, operator, body),
             }
             if action in routes: return 200, routes[action]()
         raise ApiError(404, "not_found", "接口不存在")
